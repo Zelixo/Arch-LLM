@@ -1,0 +1,14 @@
+[package]
+name = "Arch-LLM"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures-util = "0.3.31"
+gtk4 = { version = "0.10.3", features = ["v4_10"] }
+ollama-rs = { version = "0.3.3", features = ["stream"] }
+pulldown-cmark = "0.12"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+url = "2.5.8"
