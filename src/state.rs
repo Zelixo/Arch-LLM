@@ -13,6 +13,8 @@ pub struct Agent {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Profile {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub first_name: String,
     pub last_name: String,
@@ -74,4 +76,5 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub history_path: PathBuf,
     pub current_task: Option<tokio::task::AbortHandle>,
+    pub available_models: Vec<String>,
 }

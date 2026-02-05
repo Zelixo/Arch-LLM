@@ -77,6 +77,7 @@ fn build_ui(app: &Application) {
         config_path: settings_path,
         history_path,
         current_task: None,
+        available_models: Vec::new(),
     }));
 
     // --- Root Stack (Loading -> Error -> Main) ---
@@ -447,99 +448,139 @@ fn build_ui(app: &Application) {
         .build();
     agents_box.append(&scrolled_agents);
 
-    let refresh_agents_list_func = move |state: Arc<Mutex<AppState>>, agents_list: ListBox, agent_names_list: StringList| {
-        while let Some(child) = agents_list.first_child() {
-            agents_list.remove(&child);
-        }
-        refresh_agent_dropdown_func(state.clone(), agent_names_list.clone());
-        let agents = {
-            let s = state.lock().expect("Failed to lock state for agents list refresh");
-            s.settings.agents.clone()
-        };
-        for (idx, agent) in agents.into_iter().enumerate() {
-            let row = Box::builder()
-                .orientation(Orientation::Vertical)
-                .spacing(5)
-                .margin_top(10)
-                .margin_bottom(10)
-                .build();
+    let refresh_agents_list_func = {
+        let state = state.clone();
+        let agents_list = agents_list.clone();
+        let agent_names_list = agent_names_list.clone();
+        
+        Rc::new(move || {
+            while let Some(child) = agents_list.first_child() {
+                agents_list.remove(&child);
+            }
+            refresh_agent_dropdown_func(state.clone(), agent_names_list.clone());
+            let (agents, available_models) = {
+                let s = state.lock().expect("Failed to lock state for agents list refresh");
+                (s.settings.agents.clone(), s.available_models.clone())
+            };
+            for (idx, agent) in agents.into_iter().enumerate() {
+                let row = Box::builder()
+                    .orientation(Orientation::Vertical)
+                    .spacing(5)
+                    .margin_top(10)
+                    .margin_bottom(10)
+                    .build();
 
-            row.append(&Label::builder().label("Agent Name").xalign(0.0).css_classes(["settings-label"]).build());
-            let name_entry = Entry::builder().text(&agent.name).placeholder_text("Name").build();
-            row.append(&name_entry);
+                row.append(&Label::builder().label("Agent Name").xalign(0.0).css_classes(["settings-label"]).build());
+                let name_entry = Entry::builder().text(&agent.name).placeholder_text("Name").build();
+                row.append(&name_entry);
 
-            row.append(&Label::builder().label("Description").xalign(0.0).css_classes(["settings-label"]).build());
-            let desc_entry = Entry::builder().text(&agent.description).placeholder_text("Description").build();
-            row.append(&desc_entry);
+                row.append(&Label::builder().label("Description").xalign(0.0).css_classes(["settings-label"]).build());
+                let desc_entry = Entry::builder().text(&agent.description).placeholder_text("Description").build();
+                row.append(&desc_entry);
 
-            row.append(&Label::builder().label("Model").xalign(0.0).css_classes(["settings-label"]).build());
-            let model_entry = Entry::builder().text(&agent.model).placeholder_text("Model").build();
-            row.append(&model_entry);
-
-            row.append(&Label::builder().label("System Prompt").xalign(0.0).css_classes(["settings-label"]).build());
-            let prompt_entry = Entry::builder().text(&agent.system_prompt).placeholder_text("System Prompt").build();
-            row.append(&prompt_entry);
-
-            let actions_box = Box::builder().orientation(Orientation::Horizontal).spacing(10).margin_top(5).build();
-            let save_btn = Button::with_label("Save");
-            let delete_btn = Button::with_label("Delete");
-            actions_box.append(&save_btn);
-            actions_box.append(&delete_btn);
-            row.append(&actions_box);
-            row.append(&gtk::Separator::new(Orientation::Horizontal));
-
-            let state_c = state.clone();
-            let name_c = name_entry.clone();
-            let desc_c = desc_entry.clone();
-            let model_c = model_entry.clone();
-            let prompt_c = prompt_entry.clone();
-            let agent_names_list_c = agent_names_list.clone();
-            save_btn.connect_clicked(move |_| {
-                let name = name_c.text().to_string();
-                let desc = desc_c.text().to_string();
-                let model = model_c.text().to_string();
-                let prompt = prompt_c.text().to_string();
+                row.append(&Label::builder().label("Model").xalign(0.0).css_classes(["settings-label"]).build());
                 
-                {
-                    let mut s = state_c.lock().expect("Failed to lock state for saving agent");
-                    if let Some(a) = s.settings.agents.get_mut(idx) {
-                        a.name = name;
-                        a.description = desc;
-                        a.model = model;
-                        a.system_prompt = prompt;
-                        if let Err(e) = fs::write(&s.config_path, serde_json::to_string(&s.settings).expect("Failed to serialize settings")) {
-                            eprintln!("Failed to write settings.json: {}", e);
-                        }
+                let model_list = StringList::new(&[]);
+                let model_refs: Vec<&str> = available_models.iter().map(|s| s.as_str()).collect();
+                model_list.splice(0, 0, &model_refs);
+                
+                // If current model is not in list (or list empty), add it so user can see/save it
+                let mut selected_idx = 0;
+                let mut found = false;
+                for (i, m) in available_models.iter().enumerate() {
+                    if m == &agent.model {
+                        selected_idx = i;
+                        found = true;
+                        break;
                     }
                 }
-                refresh_agent_dropdown_func(state_c.clone(), agent_names_list_c.clone());
-            });
-
-            let state_d = state.clone();
-            let agent_name_clone = agent.name.clone();
-            let agents_list_clone = agents_list.clone();
-            let row_clone = row.clone();
-            let agent_names_list_d = agent_names_list.clone();
-            delete_btn.connect_clicked(move |_| {
-                let mut s = state_d.lock().expect("Failed to lock state for deleting agent");
-                s.settings.agents.retain(|a| a.name != agent_name_clone);
-                if let Err(e) = fs::write(&s.config_path, serde_json::to_string(&s.settings).expect("Failed to serialize settings")) {
-                    eprintln!("Failed to write settings.json: {}", e);
+                if !found && !agent.model.is_empty() {
+                    model_list.append(&agent.model);
+                    selected_idx = available_models.len();
                 }
-                drop(s);
-                agents_list_clone.remove(&row_clone);
-                refresh_agent_dropdown_func(state_d.clone(), agent_names_list_d.clone());
-            });
-            agents_list.append(&row);
-        }
+
+                let model_dropdown = DropDown::builder()
+                    .model(&model_list)
+                    .selected(selected_idx as u32)
+                    .build();
+                row.append(&model_dropdown);
+
+                row.append(&Label::builder().label("System Prompt").xalign(0.0).css_classes(["settings-label"]).build());
+                let prompt_entry = Entry::builder().text(&agent.system_prompt).placeholder_text("System Prompt").build();
+                row.append(&prompt_entry);
+
+                let actions_box = Box::builder().orientation(Orientation::Horizontal).spacing(10).margin_top(5).build();
+                let save_btn = Button::with_label("Save");
+                let delete_btn = Button::with_label("Delete");
+                actions_box.append(&save_btn);
+                actions_box.append(&delete_btn);
+                row.append(&actions_box);
+                row.append(&gtk::Separator::new(Orientation::Horizontal));
+
+                let state_c = state.clone();
+                let name_c = name_entry.clone();
+                let desc_c = desc_entry.clone();
+                let model_c = model_dropdown.clone();
+                let prompt_c = prompt_entry.clone();
+                let agent_names_list_c = agent_names_list.clone();
+                save_btn.connect_clicked(move |_| {
+                    let name = name_c.text().to_string();
+                    let desc = desc_c.text().to_string();
+                    let model = if let Some(item) = model_c.selected_item() {
+                        item.downcast::<gtk::StringObject>().unwrap().string().to_string()
+                    } else {
+                        "".to_string()
+                    };
+                    let prompt = prompt_c.text().to_string();
+                    
+                    {
+                        let mut s = state_c.lock().expect("Failed to lock state for saving agent");
+                        if let Some(a) = s.settings.agents.get_mut(idx) {
+                            a.name = name;
+                            a.description = desc;
+                            a.model = model;
+                            a.system_prompt = prompt;
+                            if let Err(e) = fs::write(&s.config_path, serde_json::to_string(&s.settings).expect("Failed to serialize settings")) {
+                                eprintln!("Failed to write settings.json: {}", e);
+                            }
+                        }
+                    }
+                    refresh_agent_dropdown_func(state_c.clone(), agent_names_list_c.clone());
+                });
+
+                let state_d = state.clone();
+                let agent_name_clone = agent.name.clone();
+                let agents_list_clone = agents_list.clone();
+                let row_clone = row.clone();
+                let agent_names_list_d = agent_names_list.clone();
+                delete_btn.connect_clicked(move |_| {
+                    let mut s = state_d.lock().expect("Failed to lock state for deleting agent");
+                    s.settings.agents.retain(|a| a.name != agent_name_clone);
+                    if let Err(e) = fs::write(&s.config_path, serde_json::to_string(&s.settings).expect("Failed to serialize settings")) {
+                        eprintln!("Failed to write settings.json: {}", e);
+                    }
+                    drop(s);
+                    agents_list_clone.remove(&row_clone);
+                    refresh_agent_dropdown_func(state_d.clone(), agent_names_list_d.clone());
+                });
+                agents_list.append(&row);
+            }
+        })
     };
 
-    refresh_agents_list_func(state.clone(), agents_list.clone(), agent_names_list.clone());
+    refresh_agents_list_func();
+
+    let settings_stack_c = settings_stack.clone();
+    let refresh_agents = refresh_agents_list_func.clone();
+    settings_stack_c.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() == Some("agents") {
+            (refresh_agents)();
+        }
+    });
 
     let add_agent_btn = Button::with_label("Add Agent");
     let state_add = state.clone();
-    let agents_list_add = agents_list.clone();
-    let agent_names_list_add = agent_names_list.clone();
+    let refresh_agents_add = refresh_agents_list_func.clone();
     add_agent_btn.connect_clicked(move |_| {
         let mut s = state_add.lock().expect("Failed to lock state for adding agent");
         s.settings.agents.push(Agent {
@@ -552,7 +593,7 @@ fn build_ui(app: &Application) {
             eprintln!("Failed to write settings.json: {}", e);
         }
         drop(s);
-        refresh_agents_list_func(state_add.clone(), agents_list_add.clone(), agent_names_list_add.clone());
+        refresh_agents_add();
     });
 
     let delete_chat_history_btn = Button::with_label("Delete Chat History");
@@ -606,6 +647,10 @@ fn build_ui(app: &Application) {
             glib::MainContext::default().spawn_local(async move {
                 let ollama = state.lock().unwrap().ollama.clone();
                 if let Ok(models) = ollama.list_local_models().await {
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.available_models = models.iter().map(|m| m.name.clone()).collect();
+                    }
                     while let Some(child) = models_list.first_child() {
                         models_list.remove(&child);
                     }
@@ -1559,10 +1604,17 @@ fn build_ui(app: &Application) {
         let state = state_conn.clone();
         glib::MainContext::default().spawn_local(async move {
             let ollama = state.lock().unwrap().ollama.clone();
-            if ollama.list_local_models().await.is_ok() {
-                root_stack_c.set_visible_child_name("main");
-            } else {
-                root_stack_c.set_visible_child_name("error");
+            match ollama.list_local_models().await {
+                Ok(models) => {
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.available_models = models.into_iter().map(|m| m.name).collect();
+                    }
+                    root_stack_c.set_visible_child_name("main");
+                }
+                Err(_) => {
+                    root_stack_c.set_visible_child_name("error");
+                }
             }
         });
     }));
@@ -1570,10 +1622,17 @@ fn build_ui(app: &Application) {
     // Trigger check
     glib::MainContext::default().spawn_local(async move {
         let ollama = state_conn.lock().unwrap().ollama.clone();
-        if ollama.list_local_models().await.is_ok() {
-            root_stack_c.set_visible_child_name("main");
-        } else {
-            root_stack_c.set_visible_child_name("error");
+        match ollama.list_local_models().await {
+            Ok(models) => {
+                {
+                    let mut s = state_conn.lock().unwrap();
+                    s.available_models = models.into_iter().map(|m| m.name).collect();
+                }
+                root_stack_c.set_visible_child_name("main");
+            }
+            Err(_) => {
+                root_stack_c.set_visible_child_name("error");
+            }
         }
     });
 
