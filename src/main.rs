@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use gtk::{
     Application, ApplicationWindow, Box, Orientation, Label, Entry, Button,
     ScrolledWindow, ListBox, DropDown, StringList, Stack, StackSidebar,
-    Popover, GestureClick, EventControllerKey, Spinner, MenuButton
+    Popover, GestureClick, EventControllerKey, Spinner, MenuButton, TextView
 };
 use std::sync::{Arc, Mutex};
 use serde_json;
@@ -24,18 +24,21 @@ mod utils;
 use state::{AppState, Agent, Profile, Settings, ChatHistory, ChatEvent};
 use utils::{normalize_url, parse_markdown, markdown_to_pango, MarkdownBlock};
 
-fn get_config_files() -> (PathBuf, PathBuf) {
+fn get_config_files() -> (PathBuf, PathBuf, PathBuf) {
     let dirs = ProjectDirs::from("org", "archllm", "arch-llm").expect("Could not determine project directories");
     
     let config_dir = dirs.config_dir();
     let data_dir = dirs.data_dir();
+    let memory_dir = data_dir.join("memories");
 
     fs::create_dir_all(config_dir).expect("Could not create config directory");
     fs::create_dir_all(data_dir).expect("Could not create data directory");
+    fs::create_dir_all(&memory_dir).expect("Could not create memory directory");
 
     (
         config_dir.join("settings.json"),
-        data_dir.join("history.json")
+        data_dir.join("history.json"),
+        memory_dir
     )
 }
 
@@ -51,17 +54,29 @@ async fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application) {
-    let (settings_path, history_path) = get_config_files();
+    let (settings_path, history_path, memory_path) = get_config_files();
 
     let history_data = fs::read_to_string(&history_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<ChatHistory>>(&s).ok())
         .unwrap_or_default();
 
-    let settings_data = fs::read_to_string(&settings_path)
+    let mut settings_data = fs::read_to_string(&settings_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
         .unwrap_or_else(|| Settings::default());
+
+    // Ensure all profiles have IDs
+    let mut modified = false;
+    for profile in &mut settings_data.profiles {
+        if profile.id.is_empty() {
+            profile.id = glib::uuid_string_random().to_string();
+            modified = true;
+        }
+    }
+    if modified {
+        let _ = fs::write(&settings_path, serde_json::to_string(&settings_data).unwrap());
+    }
 
     let ollama_url = normalize_url(&settings_data.ollama_endpoint);
     let ollama = Ollama::from_url(
@@ -76,6 +91,7 @@ fn build_ui(app: &Application) {
         settings: settings_data,
         config_path: settings_path,
         history_path,
+        memory_path,
         current_task: None,
         available_models: Vec::new(),
     }));
@@ -792,12 +808,25 @@ fn build_ui(app: &Application) {
     let activate_btn = Button::with_label("Use This Profile");
     let save_btn = Button::with_label("Save Changes");
     let delete_btn = Button::with_label("Delete Profile");
+    let clear_mem_btn = Button::with_label("Clear Memory");
+    
     delete_btn.add_css_class("destructive-action");
+    clear_mem_btn.add_css_class("destructive-action");
     
     actions_box.append(&activate_btn);
     actions_box.append(&save_btn);
     actions_box.append(&delete_btn);
+    actions_box.append(&clear_mem_btn);
     editor_page.append(&actions_box);
+
+    editor_page.append(&Label::builder().label("Long-term Memory").xalign(0.0).css_classes(["settings-label"]).build());
+    let memory_view = TextView::builder()
+        .editable(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .height_request(150)
+        .build();
+    let memory_scroll = ScrolledWindow::builder().child(&memory_view).vexpand(true).build();
+    editor_page.append(&memory_scroll);
 
     editor_stack.add_named(&editor_page, Some("editor"));
     personalization_box.append(&editor_stack);
@@ -818,6 +847,7 @@ fn build_ui(app: &Application) {
         let edit_location = edit_location.clone();
         let edit_bio = edit_bio.clone();
         let activate_btn = activate_btn.clone();
+        let memory_view = memory_view.clone();
 
         let refresh_ref: Rc<RefCell<Option<std::boxed::Box<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let refresh_ref_weak = refresh_ref.clone();
@@ -827,9 +857,9 @@ fn build_ui(app: &Application) {
                 profiles_list.remove(&child);
             }
             
-            let (profiles, active_profile) = {
+            let (profiles, active_profile, memory_path) = {
                 let s = state.lock().unwrap();
-                (s.settings.profiles.clone(), s.settings.active_profile.clone())
+                (s.settings.profiles.clone(), s.settings.active_profile.clone(), s.memory_path.clone())
             };
 
             let current_sel = *selected_idx.borrow();
@@ -876,6 +906,7 @@ fn build_ui(app: &Application) {
                 {
                     let mut s = state_add.lock().unwrap();
                     s.settings.profiles.push(Profile {
+                        id: glib::uuid_string_random().to_string(),
                         name: "New Profile".to_string(),
                         first_name: "".to_string(),
                         last_name: "".to_string(),
@@ -905,6 +936,11 @@ fn build_ui(app: &Application) {
                     edit_phone.set_text(&profile.phone);
                     edit_location.set_text(&profile.location);
                     edit_bio.set_text(&profile.bio);
+
+                    // Load Memory
+                    let mem_file = memory_path.join(format!("{}.txt", profile.id));
+                    let memory = fs::read_to_string(mem_file).unwrap_or_default();
+                    memory_view.buffer().set_text(&memory);
                     
                     if let Some(active) = &active_profile {
                         if active == &profile.name {
@@ -996,6 +1032,20 @@ fn build_ui(app: &Application) {
         }
         *sel_del.borrow_mut() = None;
         refresh_del();
+    });
+
+    let state_clr = state.clone();
+    let sel_clr = selected_profile_idx.clone();
+    let refresh_clr = call_refresh.clone();
+    clear_mem_btn.connect_clicked(move |_| {
+        if let Some(idx) = *sel_clr.borrow() {
+            let s = state_clr.lock().unwrap();
+            if let Some(p) = s.settings.profiles.get(idx) {
+                let mem_file = s.memory_path.join(format!("{}.txt", p.id));
+                let _ = fs::remove_file(mem_file);
+            }
+        }
+        refresh_clr();
     });
 
     let personalization_scrolled = ScrolledWindow::builder()
@@ -1325,23 +1375,38 @@ fn build_ui(app: &Application) {
         let text_task = text.clone();
         
         let task = tokio::spawn(async move {
-            let (ollama, model, messages) = {
+            let (ollama, model, messages, profile_id, memory_path) = {
                 let mut s = state.lock().unwrap();
                 let agent = s.settings.agents.get(s.current_agent_idx).cloned().unwrap_or_else(|| s.settings.agents[0].clone());
                 
+                let mut profile_info = None;
+                if let Some(active_name) = &s.settings.active_profile {
+                    if let Some(profile) = s.settings.profiles.iter().find(|p| &p.name == active_name) {
+                        profile_info = Some((profile.id.clone(), profile.first_name.clone(), profile.last_name.clone(), profile.location.clone(), profile.bio.clone()));
+                    }
+                }
+
                 if s.messages.is_empty() {
                     let mut system_prompt = agent.system_prompt.clone();
-                    if let Some(active_name) = &s.settings.active_profile {
-                        if let Some(profile) = s.settings.profiles.iter().find(|p| &p.name == active_name) {
-                            system_prompt.push_str("\n\n---\nUser Profile:\n");
-                            if !profile.first_name.is_empty() || !profile.last_name.is_empty() {
-                                system_prompt.push_str(&format!("Name: {} {}\n", profile.first_name, profile.last_name));
-                            }
-                            if !profile.location.is_empty() {
-                                system_prompt.push_str(&format!("Location: {}\n", profile.location));
-                            }
-                            if !profile.bio.is_empty() {
-                                system_prompt.push_str(&format!("Bio: {}\n", profile.bio));
+                    
+                    if let Some((id, fname, lname, loc, bio)) = &profile_info {
+                        system_prompt.push_str("\n\n---\nUser Profile:\n");
+                        if !fname.is_empty() || !lname.is_empty() {
+                            system_prompt.push_str(&format!("Name: {} {}\n", fname, lname));
+                        }
+                        if !loc.is_empty() {
+                            system_prompt.push_str(&format!("Location: {}\n", loc));
+                        }
+                        if !bio.is_empty() {
+                            system_prompt.push_str(&format!("Bio: {}\n", bio));
+                        }
+
+                        // Load Long-term Memory
+                        let mem_file = s.memory_path.join(format!("{}.txt", id));
+                        if let Ok(memory) = fs::read_to_string(&mem_file) {
+                            if !memory.trim().is_empty() {
+                                system_prompt.push_str("\nLong-term Memory of User:\n");
+                                system_prompt.push_str(&memory);
                             }
                         }
                     }
@@ -1349,11 +1414,11 @@ fn build_ui(app: &Application) {
                 }
                 
                 s.messages.push(ChatMessage::user(text_task.clone()));
-                (s.ollama.clone(), agent.model.clone(), s.messages.clone())
+                (s.ollama.clone(), agent.model.clone(), s.messages.clone(), profile_info.map(|p| p.0), s.memory_path.clone())
             };
 
             match ollama.send_chat_messages_stream(
-                ChatMessageRequest::new(model.clone(), messages)
+                ChatMessageRequest::new(model.clone(), messages.clone())
             ).await {
                 Ok(mut stream) => {
                     let mut full_response = String::new();
@@ -1364,6 +1429,40 @@ fn build_ui(app: &Application) {
                             if sender.send(ChatEvent::Chunk(msg.content)).await.is_err() { break; }
                         }
                     }
+                    
+                    // Update Memory if profile is active
+                    if let Some(id) = profile_id {
+                        let ollama_mem = ollama.clone();
+                        let model_mem = model.clone();
+                        let mut messages_mem = messages.clone();
+                        messages_mem.push(ChatMessage::assistant(full_response.clone()));
+                        let memory_path_mem = memory_path.clone();
+
+                        tokio::spawn(async move {
+                            let mem_file = memory_path_mem.join(format!("{}.txt", id));
+                            let existing_memory = fs::read_to_string(&mem_file).unwrap_or_default();
+                            
+                            let memory_prompt = format!(
+                                "You are a memory module. Based on the recent conversation above and the existing knowledge about the user, update the Long-term Memory. \
+                                Existing Knowledge:\n{}\n\n\
+                                Requirements:\n\
+                                1. Output a concise, bulleted list of facts, preferences, and important context about the user.\n\
+                                2. Include new info from this chat.\n\
+                                3. Keep it brief and relevant for future assistance.\n\
+                                4. Output ONLY the list, no headers or conversational text.",
+                                existing_memory
+                            );
+                            
+                            messages_mem.push(ChatMessage::user(memory_prompt));
+                            if let Ok(res) = ollama_mem.send_chat_messages(ChatMessageRequest::new(model_mem, messages_mem)).await {
+                                let new_memory = res.message.content.trim().to_string();
+                                if !new_memory.is_empty() {
+                                    let _ = fs::write(mem_file, new_memory);
+                                }
+                            }
+                        });
+                    }
+
                     let _ = sender.send(ChatEvent::Done(full_response)).await;
                 }
                 Err(e) => {

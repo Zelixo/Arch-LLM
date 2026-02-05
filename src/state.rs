@@ -75,6 +75,7 @@ pub struct AppState {
     pub settings: Settings,
     pub config_path: PathBuf,
     pub history_path: PathBuf,
+    pub memory_path: PathBuf,
     pub current_task: Option<tokio::task::AbortHandle>,
     pub available_models: Vec<String>,
 }
