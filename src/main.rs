@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use gtk::{
     Application, ApplicationWindow, Box, Orientation, Label, Entry, Button,
     ScrolledWindow, ListBox, DropDown, StringList, Stack, StackSidebar,
-    Popover, GestureClick, EventControllerKey, Spinner, MenuButton, TextView
+    Popover, GestureClick, EventControllerKey, Spinner, TextView
 };
 use std::sync::{Arc, Mutex};
 use serde_json;
@@ -88,7 +88,7 @@ fn build_ui(app: &Application) {
         current_agent_idx: 0,
         messages: Vec::new(),
         history: history_data,
-        settings: settings_data,
+        settings: settings_data.clone(),
         config_path: settings_path,
         history_path,
         memory_path,
@@ -114,18 +114,31 @@ fn build_ui(app: &Application) {
     loading_box.append(&Label::new(Some("Connecting to Ollama...")));
     root_stack.add_named(&loading_box, Some("loading"));
 
-    // Error Page
+    // Setup / Error Page
     let error_box = Box::builder()
         .orientation(Orientation::Vertical)
         .valign(gtk::Align::Center)
         .halign(gtk::Align::Center)
         .spacing(20)
+        .width_request(400)
         .build();
-    let error_icon = Label::builder().label("⚠️").css_classes(["welcome-icon"]).build(); // Reuse big icon style
-    let error_label = Label::new(Some("Could not connect to Ollama."));
-    let retry_btn = Button::with_label("Retry");
+    let error_icon = Label::builder().label("🌐").css_classes(["welcome-icon"]).build();
+    let error_label = Label::builder()
+        .label("Could not connect to Ollama.\nPlease check your endpoint address.")
+        .justify(gtk::Justification::Center)
+        .build();
+    
+    let endpoint_entry_setup = Entry::builder()
+        .placeholder_text("http://localhost:11434")
+        .text(&settings_data.ollama_endpoint)
+        .build();
+    
+    let retry_btn = Button::with_label("Connect");
+    retry_btn.add_css_class("suggested-action");
+    
     error_box.append(&error_icon);
     error_box.append(&error_label);
+    error_box.append(&endpoint_entry_setup);
     error_box.append(&retry_btn);
     root_stack.add_named(&error_box, Some("error"));
 
@@ -1696,8 +1709,28 @@ fn build_ui(app: &Application) {
     // Set initial state
     root_stack_c.set_visible_child_name("loading");
     
-    // Retry handler
+    // Retry / Setup handler
+    let endpoint_entry_setup_c = endpoint_entry_setup.clone();
+    let endpoint_entry_general_c = endpoint_entry.clone();
     retry_btn.connect_clicked(glib::clone!(#[weak] root_stack_c, #[weak] state_conn, move |_| {
+        let new_endpoint = endpoint_entry_setup_c.text().to_string();
+        
+        {
+            let mut s = state_conn.lock().unwrap();
+            s.settings.ollama_endpoint = new_endpoint.clone();
+            let final_url = normalize_url(&new_endpoint);
+            if let Ok(url) = url::Url::parse(&final_url) {
+                s.ollama = Ollama::from_url(url);
+            }
+            // Update general settings entry too
+            endpoint_entry_general_c.set_text(&new_endpoint);
+            
+            // Save settings
+            if let Err(e) = fs::write(&s.config_path, serde_json::to_string(&s.settings).unwrap()) {
+                eprintln!("Failed to write settings.json: {}", e);
+            }
+        }
+
         root_stack_c.set_visible_child_name("loading");
         let root_stack_c = root_stack_c.clone();
         let state = state_conn.clone();
